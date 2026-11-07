@@ -16,10 +16,26 @@ def cleanup_plan(catalog, releases, repository):
         assert entry['url']==asset['browser_download_url']
         assert entry['url'].startswith(f'https://github.com/{repository}/releases/download/')
     keep={'v'+v for v in versions}
-    delete_releases=[r for r in releases if re.fullmatch(r'v\d+\.\d+\.\d+',r['tag_name']) and r['tag_name'] not in keep and not r['draft']]
+    stable=[r for r in releases if re.fullmatch(r'v\d+\.\d+\.\d+',r['tag_name']) and not r['draft'] and not r.get('prerelease',False)]
+    delete_releases=[r for r in stable if r['tag_name'] not in keep]
     allowed={f'CallNote-{v}.apk' for v in versions}
-    delete_assets=[a for r in releases if r not in delete_releases and not r['draft'] for a in r['assets'] if a['name'].endswith('.apk') and a['name'] not in allowed]
+    delete_assets=[a for r in stable if r not in delete_releases for a in r['assets'] if a['name'].endswith('.apk') and a['name'] not in allowed]
     return delete_releases,delete_assets
+
+def lab_cleanup_plan(releases, repository, load_catalog):
+    labs=sorted((r for r in releases if re.fullmatch(r'lab-v\d+\.\d+\.\d+',r['tag_name']) and not r['draft'] and r.get('prerelease',False)),key=lambda r:tuple(map(int,r['tag_name'][5:].split('.'))),reverse=True)
+    if len(labs)<=3:return []
+    # Validate all three retained packages before removing anything from this channel.
+    for release in labs[:3]:
+        version=release['tag_name'][5:]
+        catalog_asset=next(a for a in release['assets'] if a['name']=='lab-catalog.json')
+        catalog=load_catalog(catalog_asset['browser_download_url'])
+        apk=next(a for a in release['assets'] if a['name']==f'CallNoteLab-{version}.apk')
+        assert catalog['schema']==1 and catalog['channel']=='samsung-import-lab' and catalog['package']=='kr.callnote.lab'
+        assert catalog['version']==version and catalog['code']>0
+        assert catalog['url']==apk['browser_download_url']==f'https://github.com/{repository}/releases/download/lab-v{version}/CallNoteLab-{version}.apk'
+        assert catalog['size']==apk['size'] and catalog['sha256']==apk['digest'].removeprefix('sha256:')
+    return labs[3:]
 
 def main():
     repo=os.environ['GITHUB_REPOSITORY']
@@ -37,6 +53,9 @@ def main():
         batch=api(f'/releases?per_page=100&page={page}');releases.extend(batch)
         if len(batch)<100:break
     remove,assets=cleanup_plan(catalog,releases,repo)
+    def load_catalog(url):
+        with urllib.request.urlopen(url,timeout=60) as response:return json.load(response)
+    remove+=lab_cleanup_plan(releases,repo,load_catalog)
     # No deletion happens before the complete new catalog and all APKs validate.
     for a in assets:
         api('/releases/assets/'+str(a['id']),'DELETE');print('Removed obsolete APK:',a['name'])
